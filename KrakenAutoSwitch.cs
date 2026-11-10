@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -9,10 +10,12 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 
-// Razer Kraken V4 (동글 상시 연결) 헤드폰 전원 ON/OFF를 동글의 HID 이벤트로 감지해
-// Windows 기본 출력 장치를 자동 전환하는 트레이 프로그램.
-//   ON  -> Kraken 'Game'(재생) / 'Chat'(통신) 으로 전환, 직전 기본 장치는 저장
-//   OFF -> 저장해 둔 직전 장치로 복원 (없으면 config 의 fallback)
+// Wireless headset auto audio switch (USB dongle stays plugged in).
+// Detects headset power on/off through the dongle's HID interface and switches
+// the Windows default output device:
+//   ON  -> headset (playback + communications), previous defaults are remembered
+//   OFF -> restore the remembered devices (or the configured fallback)
+// Supported: Razer Kraken V4 (event driven), Logitech G325 LIGHTSPEED (polled).
 static class Program
 {
     [STAThread]
@@ -28,6 +31,15 @@ static class Program
     }
 }
 
+class Headset
+{
+    public string Key, Name, GameName, ChatName;
+    public bool Present;      // dongle found
+    public int State = -1;    // -1 unknown, 0 off, 1 on
+    public DateTime OnSince;
+    public ToolStripMenuItem StatusItem, SwitchItem;
+}
+
 class TrayApp : ApplicationContext
 {
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -36,9 +48,11 @@ class TrayApp : ApplicationContext
     readonly string dir = AppDomain.CurrentDomain.BaseDirectory;
     readonly NotifyIcon tray = new NotifyIcon();
     readonly SynchronizationContext ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-    ToolStripMenuItem stateItem, autoStartItem;
-    int state = -1; // -1 unknown, 0 off, 1 on
-    string gameName = "Razer Kraken V4 - Game", chatName = "Razer Kraken V4 - Chat", fallbackName = "";
+    readonly Headset kraken = new Headset { Key = "kraken", Name = "Razer Kraken V4", GameName = "Razer Kraken V4 - Game", ChatName = "Razer Kraken V4 - Chat" };
+    readonly Headset g325 = new Headset { Key = "g325", Name = "Logitech G325", GameName = "G325 LIGHTSPEED", ChatName = "G325 LIGHTSPEED" };
+    readonly List<Headset> headsets = new List<Headset>();
+    ToolStripMenuItem noneItem, autoStartItem;
+    string fallbackName = "";
     string lang = "auto"; // auto | en | ko
     bool ko;
     string[] saved = new string[3]; // previous default device ids (console, multimedia, communications)
@@ -48,28 +62,40 @@ class TrayApp : ApplicationContext
 
     public TrayApp()
     {
+        headsets.Add(kraken); headsets.Add(g325);
         LoadConfig();
         LoadSaved();
         ko = lang == "ko" || (lang == "auto" && System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ko");
 
-        stateItem = new ToolStripMenuItem("") { Enabled = false };
-        autoStartItem = new ToolStripMenuItem(T("Start with Windows", "Windows 시작 시 자동 실행"));
         var menu = new ContextMenuStrip();
-        menu.Items.Add(stateItem);
+        noneItem = new ToolStripMenuItem(T("No supported headset dongle found", "지원하는 헤드셋 동글이 없음")) { Enabled = false };
+        menu.Items.Add(noneItem);
+        foreach (var h in headsets)
+        {
+                        h.StatusItem = new ToolStripMenuItem("") { Enabled = false, Visible = false };
+            menu.Items.Add(h.StatusItem);
+        }
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(T("Switch to Kraken now", "Kraken으로 지금 전환"), null, (s, e) => SwitchTo(true));
-        menu.Items.Add(T("Restore previous device now", "이전 장치로 지금 복원"), null, (s, e) => SwitchTo(false));
+        foreach (var h in headsets)
+        {
+            var hh = h;
+            h.SwitchItem = new ToolStripMenuItem(string.Format(T("Switch to {0} now", "{0}(으)로 지금 전환"), h.Name), null, (s, e) => SwitchToHeadset(hh)) { Visible = false };
+            menu.Items.Add(h.SwitchItem);
+        }
+        menu.Items.Add(T("Restore previous device now", "이전 장치로 지금 복원"), null, (s, e) => Restore(true));
         menu.Items.Add(new ToolStripSeparator());
+        autoStartItem = new ToolStripMenuItem(T("Start with Windows", "Windows 시작 시 자동 실행"));
         autoStartItem.Checked = IsAutoStart();
         autoStartItem.Click += (s, e) => { SetAutoStart(!IsAutoStart()); autoStartItem.Checked = IsAutoStart(); };
         menu.Items.Add(autoStartItem);
         menu.Items.Add(T("Open log", "로그 열기"), null, (s, e) => { try { System.Diagnostics.Process.Start(Path.Combine(dir, "KrakenAutoSwitch.log")); } catch { } });
         menu.Items.Add(T("Exit", "종료"), null, (s, e) => { tray.Visible = false; Application.Exit(); });
         tray.ContextMenuStrip = menu;
-        SetState(-1);
+        UpdateTray();
         tray.Visible = true;
 
-        new Thread(HidLoop) { IsBackground = true }.Start();
+        new Thread(KrakenLoop) { IsBackground = true }.Start();
+        new Thread(G325Loop) { IsBackground = true }.Start();
     }
 
     // ---------- 설정 / 상태 파일 ----------
@@ -77,13 +103,21 @@ class TrayApp : ApplicationContext
     {
         string p = Path.Combine(dir, "KrakenAutoSwitch.ini");
         if (!File.Exists(p))
-            File.WriteAllText(p, "; Device names are substring matches (part of the name shown in Sound settings). / 장치 이름은 '포함' 일치입니다.\r\ngame=" + gameName + "\r\nchat=" + chatName + "\r\n; Device to switch to on power-off if no previous device was remembered (empty = do nothing).\r\n; 헤드폰을 끌 때 저장된 직전 장치가 없으면 이 장치로 전환 (비우면 아무것도 안 함)\r\nfallback=\r\n; UI language: auto (follow Windows) | en | ko\r\nlanguage=auto\r\n", Encoding.UTF8);
+        {
+            var sb = new StringBuilder();
+            sb.Append("; Device names are substring matches (part of the name shown in Sound settings). / 장치 이름은 '포함' 일치입니다.\r\n");
+            foreach (var h in headsets) sb.Append(h.Key + ".game=" + h.GameName + "\r\n" + h.Key + ".chat=" + h.ChatName + "\r\n");
+            sb.Append("; Device to switch to on power-off if no previous device was remembered (empty = do nothing).\r\n; 헤드폰을 끌 때 저장된 직전 장치가 없으면 이 장치로 전환 (비우면 아무것도 안 함)\r\nfallback=\r\n; UI language: auto (follow Windows) | en | ko\r\nlanguage=auto\r\n");
+            File.WriteAllText(p, sb.ToString(), Encoding.UTF8);
+        }
         foreach (var line in File.ReadAllLines(p, Encoding.UTF8))
         {
             int i = line.IndexOf('=');
             if (line.StartsWith(";") || i < 0) continue;
             string k = line.Substring(0, i).Trim().ToLower(), v = line.Substring(i + 1).Trim();
-            if (k == "game") gameName = v; else if (k == "chat") chatName = v; else if (k == "fallback") fallbackName = v; else if (k == "language") lang = v.ToLower();
+            if (k == "game") kraken.GameName = v; else if (k == "chat") kraken.ChatName = v; // v1.x keys
+            else if (k == "fallback") fallbackName = v; else if (k == "language") lang = v.ToLower();
+            foreach (var h in headsets) { if (k == h.Key + ".game") h.GameName = v; else if (k == h.Key + ".chat") h.ChatName = v; }
         }
     }
 
@@ -113,10 +147,26 @@ class TrayApp : ApplicationContext
     }
 
     // ---------- 트레이 표시 ----------
-    void SetState(int s)
+    string StateText(Headset h)
     {
-        state = s;
-        Color c = s == 1 ? Color.LimeGreen : s == 0 ? Color.Gray : Color.Orange;
+        return h.State == 1 ? T("on", "켜짐") : h.State == 0 ? T("off", "꺼짐") : T("unknown (until next on/off)", "알 수 없음 (다음 on/off 때 확정)");
+    }
+
+    void UpdateTray()
+    {
+        bool anyOn = false, anyUnknown = false, anyPresent = false;
+        var tip = new List<string>();
+        foreach (var h in headsets)
+        {
+            h.StatusItem.Visible = h.SwitchItem.Visible = h.Present;
+            if (!h.Present) continue;
+            anyPresent = true;
+            anyOn |= h.State == 1; anyUnknown |= h.State == -1;
+            h.StatusItem.Text = h.Name + ": " + StateText(h);
+            tip.Add(h.Name + ": " + StateText(h));
+        }
+        noneItem.Visible = !anyPresent;
+        Color c = anyOn ? Color.LimeGreen : anyUnknown || !anyPresent ? Color.Orange : Color.Gray;
         using (var bmp = new Bitmap(16, 16))
         {
             using (var g = Graphics.FromImage(bmp))
@@ -129,77 +179,222 @@ class TrayApp : ApplicationContext
             tray.Icon = Icon.FromHandle(bmp.GetHicon());
             if (old != null) old.Dispose();
         }
-        string t = s == 1 ? T("Headset on", "헤드폰 켜짐") : s == 0 ? T("Headset off", "헤드폰 꺼짐") : T("Headset state unknown (until next on/off)", "헤드폰 상태 알 수 없음 (다음 on/off 때 확정)");
-        stateItem.Text = T("Status: ", "상태: ") + t;
-        tray.Text = T("Kraken Auto Switch - ", "Kraken 자동 전환 - ") + t;
+        string text = T("Headset Auto Switch", "헤드셋 자동 전환") + (tip.Count > 0 ? "\n" + string.Join("\n", tip) : "");
+        tray.Text = text.Length > 63 ? text.Substring(0, 63) : text; // NotifyIcon limit
     }
 
-    // ---------- HID 감시 ----------
-    void HidLoop()
+    // ---------- 헤드셋 감시 ----------
+    void SetPresent(Headset h, bool present)
+    {
+        ui.Post(_ =>
+        {
+            if (h.Present == present) return;
+            h.Present = present;
+            if (!present) h.State = -1;
+            Log(h.Name + " dongle " + (present ? "found" : "removed"));
+            UpdateTray();
+        }, null);
+    }
+
+    void PostState(Headset h, int s) { ui.Post(_ => Apply(h, s), null); }
+
+    // Razer Kraken V4: the dongle sends an event on power change.
+    //   02 0A 60 .. .. .. 05 00 80 80 20 02 01 <state>   (01 = on, 00 = off)
+    void KrakenLoop()
     {
         while (true)
         {
             try
             {
                 string path = Hid.FindPath(0x1532, 0x056C, 0xFF14);
-                if (path != null) Hid.ReadLoop(path, OnReport);
+                if (path != null)
+                {
+                    SetPresent(kraken, true);
+                    Hid.ReadLoop(path, (b, n) =>
+                    {
+                        if (n < 14 || b[1] != 0x0A || b[10] != 0x20 || b[11] != 0x02 || b[12] != 0x01) return;
+                        PostState(kraken, b[13] == 1 ? 1 : 0);
+                    });
+                }
+                SetPresent(kraken, false);
             }
-            catch (Exception ex) { Log("HID error: " + ex.Message); }
+            catch (Exception ex) { Log("Kraken HID error: " + ex.Message); }
             Thread.Sleep(2000); // 동글 재연결 / 절전 복귀 대비
         }
     }
 
-    void OnReport(byte[] b, int n)
+    // Logitech G325: the dongle does not announce power changes, so poll the headset
+    // through the Centurion bridge (same protocol as Solaar's PRO X 2 / G522 support).
+    void G325Loop()
     {
-        // 02 0A 60 .. .. .. 05 00 80 80 20 02 01 <상태>   (상태 01=켜짐, 00=꺼짐)
-        if (n < 14 || b[1] != 0x0A || b[10] != 0x20 || b[11] != 0x02 || b[12] != 0x01) return;
-        int s = b[13] == 1 ? 1 : 0;
-        ui.Post(_ => Apply(s), null);
+        while (true)
+        {
+            try
+            {
+                string path = Hid.FindPath(0x046D, 0x0B21, 0xFFA0);
+                if (path != null)
+                {
+                    SetPresent(g325, true);
+                    Centurion.Poll(path, s => PostState(g325, s), Log);
+                }
+                SetPresent(g325, false);
+            }
+            catch (Exception ex) { Log("G325 HID error: " + ex.Message); }
+            Thread.Sleep(3000);
+        }
     }
 
-    void Apply(int s)
+    void Apply(Headset h, int s)
     {
-        if (s == state) return;
-        Log("Headset " + (s == 1 ? "ON" : "OFF"));
-        SetState(s);
-        SwitchTo(s == 1);
+        if (s == h.State) return;
+        h.State = s;
+        if (s == 1) h.OnSince = DateTime.Now;
+        Log(h.Name + " " + (s == 1 ? "ON" : "OFF"));
+        UpdateTray();
+        // 가장 최근에 켜진 헤드셋으로, 모두 꺼졌으면 이전 장치로
+        Headset active = null;
+        foreach (var x in headsets) if (x.State == 1 && (active == null || x.OnSince > active.OnSince)) active = x;
+        if (active != null) SwitchToHeadset(active); else Restore(false);
     }
 
     // ---------- 오디오 전환 ----------
-    void SwitchTo(bool kraken)
+    static Audio.Dev Find(List<Audio.Dev> devs, string name)
+    {
+        return string.IsNullOrEmpty(name) ? null : devs.Find(d => d.Name.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    bool IsHeadsetDevice(List<Audio.Dev> devs, string id)
+    {
+        if (id == null) return false;
+        foreach (var h in headsets)
+        {
+            var g = Find(devs, h.GameName); var c = Find(devs, h.ChatName);
+            if ((g != null && g.Id == id) || (c != null && c.Id == id)) return true;
+        }
+        return false;
+    }
+
+    void Notify(string msg) { tray.ShowBalloonTip(1500, T("Headset Auto Switch", "헤드셋 자동 전환"), msg, ToolTipIcon.None); }
+
+    void SwitchToHeadset(Headset h)
     {
         try
         {
             var devs = Audio.ListRender();
-            Func<string, Audio.Dev> find = name => string.IsNullOrEmpty(name) ? null : devs.Find(d => d.Name.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0);
-            var game = find(gameName); var chat = find(chatName) ?? game;
-            if (kraken)
-            {
-                if (game == null) { Log("Kraken Game device not found"); return; }
-                // 이미 Kraken 이 기본이 아닐 때만 '직전 장치'로 저장
-                var cur = new[] { Audio.GetDefault(0), Audio.GetDefault(1), Audio.GetDefault(2) };
-                bool curIsKraken = cur[0] == game.Id || (chat != null && cur[0] == chat.Id);
-                if (!curIsKraken) { saved = cur; SaveSaved(); }
-                Audio.SetDefault(game.Id, 0); Audio.SetDefault(game.Id, 1); Audio.SetDefault(chat.Id, 2);
-                Log("-> " + game.Name + " / comms: " + chat.Name);
-            }
-            else
-            {
-                var fb = find(fallbackName);
-                for (int role = 0; role < 3; role++)
-                {
-                    string id = saved[role];
-                    bool isKraken = (game != null && id == game.Id) || (chat != null && id == chat.Id);
-                    if (isKraken && role == 2) id = saved[0]; // 꺼진 헤드폰이 통신 기본 장치로 남지 않게
-                    if (id == null || !devs.Exists(d => d.Id == id) || (isKraken && role < 2)) id = fb != null ? fb.Id : null;
-                    if (id == null) continue;
-                    Audio.SetDefault(id, role);
-                }
-                Log("Restored: " + string.Join(" | ", Array.ConvertAll(new[] { Audio.GetDefault(0), Audio.GetDefault(1), Audio.GetDefault(2) }, id => devs.Find(d => d.Id == id) != null ? devs.Find(d => d.Id == id).Name : "?")));
-            }
-            tray.ShowBalloonTip(1500, T("Kraken Auto Switch", "Kraken 자동 전환"), kraken ? T("Output switched to Kraken", "Kraken 으로 출력 전환") : T("Restored previous output device", "이전 출력 장치로 복원"), ToolTipIcon.None);
+            var game = Find(devs, h.GameName); var chat = Find(devs, h.ChatName) ?? game;
+            if (game == null) { Log(h.Name + " playback device not found: " + h.GameName); return; }
+            var cur = new[] { Audio.GetDefault(0), Audio.GetDefault(1), Audio.GetDefault(2) };
+            if (cur[0] == game.Id && cur[2] == chat.Id) return;
+            // 다른 헤드셋이 아닌 '원래 장치'일 때만 저장
+            if (!IsHeadsetDevice(devs, cur[0])) { saved = cur; SaveSaved(); }
+            Audio.SetDefault(game.Id, 0); Audio.SetDefault(game.Id, 1); Audio.SetDefault(chat.Id, 2);
+            Log("-> " + game.Name + " / comms: " + chat.Name);
+            Notify(string.Format(T("Output switched to {0}", "{0}(으)로 출력 전환"), h.Name));
         }
         catch (Exception ex) { Log("Switch error: " + ex); }
+    }
+
+    // force=false: only when a headset is currently the default (e.g. not on startup with speakers)
+    void Restore(bool force)
+    {
+        try
+        {
+            var devs = Audio.ListRender();
+            if (!force && !IsHeadsetDevice(devs, Audio.GetDefault(0))) return;
+            var fb = Find(devs, fallbackName);
+            for (int role = 0; role < 3; role++)
+            {
+                string id = saved[role];
+                bool isHs = IsHeadsetDevice(devs, id);
+                if (isHs && role == 2) { id = saved[0]; isHs = IsHeadsetDevice(devs, id); } // 꺼진 헤드폰이 통신 기본 장치로 남지 않게
+                if (id == null || !devs.Exists(d => d.Id == id) || isHs) id = fb != null ? fb.Id : null;
+                if (id == null) continue;
+                Audio.SetDefault(id, role);
+            }
+            Log("Restored: " + string.Join(" | ", Array.ConvertAll(new[] { Audio.GetDefault(0), Audio.GetDefault(1), Audio.GetDefault(2) }, id => devs.Find(d => d.Id == id) != null ? devs.Find(d => d.Id == id).Name : "?")));
+            Notify(T("Restored previous output device", "이전 출력 장치로 복원"));
+        }
+        catch (Exception ex) { Log("Switch error: " + ex); }
+    }
+}
+
+// ================== Logitech Centurion (G325) ==================
+// Frame (0x50 addressed variant): [0x50, device_addr, cpl_length, flags, feat_idx, func|swid, params..., pad to 64]
+// cpl_length = len(feat_idx..params) + 1. See Solaar lib/logitech_receiver/base.py.
+static class Centurion
+{
+    const byte ReportId = 0x50;
+
+    static byte[] Frame(byte addr, params byte[] layer3)
+    {
+        var f = new byte[64];
+        f[0] = ReportId; f[1] = addr; f[2] = (byte)(layer3.Length + 1);
+        Array.Copy(layer3, 0, f, 4, layer3.Length);
+        return f;
+    }
+
+    static byte[] Wait(BlockingCollection<byte[]> rx, int ms, Func<byte[], bool> match)
+    {
+        var until = DateTime.Now.AddMilliseconds(ms);
+        byte[] f;
+        while (true)
+        {
+            int left = (int)(until - DateTime.Now).TotalMilliseconds;
+            if (left <= 0 || !rx.TryTake(out f, left)) return null;
+            if (match(f)) return f;
+        }
+    }
+
+    static void Drain(BlockingCollection<byte[]> rx) { byte[] x; while (rx.TryTake(out x)) { } }
+
+    // Polls the headset every ~2 s; reports 1 (answered) / 0 (two missed polls). Returns when the dongle goes away.
+    public static void Poll(string path, Action<int> onState, Action<string> log)
+    {
+        using (var rh = Hid.Open(path))
+        using (var wh = Hid.Open(path))
+        {
+            if (rh.IsInvalid || wh.IsInvalid) return;
+            var rx = new BlockingCollection<byte[]>();
+            bool alive = true;
+            var reader = new Thread(() =>
+            {
+                var b = new byte[64]; int n;
+                while (Hid.Read(rh, b, out n)) rx.Add((byte[])b.Clone());
+                alive = false;
+            }) { IsBackground = true };
+            reader.Start();
+
+            // 1) device_addr: the dongle answers ROOT.GetProtocolVersion only on the right address (G325: 0x23)
+            int addr = -1;
+            for (int i = 0; i < 256 && addr < 0 && alive; i++)
+            {
+                byte a = (byte)((0x23 + i) & 0xFF);
+                if (!Hid.Write(wh, Frame(a, 0x00, 0x1A, 0x00, 0x00, 0x00))) return;
+                var r = Wait(rx, 20, f => f[0] == ReportId && f[4] == 0x00 && f[5] == 0x1A);
+                if (r != null) addr = r[1];
+            }
+            if (addr < 0) { log("G325: no Centurion device address"); Thread.Sleep(10000); return; }
+
+            // 2) ROOT.GetFeature(0x0003 CentPPBridge) on the dongle
+            Drain(rx);
+            Hid.Write(wh, Frame((byte)addr, 0x00, 0x0A, 0x00, 0x03));
+            var fr = Wait(rx, 1000, f => f[0] == ReportId && f[4] == 0x00 && f[5] == 0x0A);
+            if (fr == null || fr[6] == 0) { log("G325: bridge feature not found"); Thread.Sleep(10000); return; }
+            byte bridge = fr[6];
+            log(string.Format("G325: centurion addr 0x{0:X2}, bridge {1}", addr, bridge));
+
+            // 3) bridge sendFragment -> headset ROOT.GetFeature(0x0001); a MessageEvent reply means the headset is on
+            int misses = 0;
+            while (alive)
+            {
+                Drain(rx);
+                if (!Hid.Write(wh, Frame((byte)addr, bridge, 0x1B, 0x00, 0x05, 0x00, 0x00, 0x0B, 0x00, 0x01))) return;
+                var ev = Wait(rx, 800, f => f[0] == ReportId && f[4] == bridge && f[5] == 0x10 && f[8] == 0x00 && f[9] == 0x00);
+                if (ev != null) { misses = 0; onState(1); }
+                else if (++misses >= 2) onState(0);
+                Thread.Sleep(1500);
+            }
+        }
     }
 }
 
@@ -219,8 +414,12 @@ static class Hid
     [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(SafeFileHandle h, byte[] buf, int len, out int read, IntPtr ov);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteFile(SafeFileHandle h, byte[] buf, int len, out int written, IntPtr ov);
 
-    static SafeFileHandle Open(string path)
+    public static bool Write(SafeFileHandle h, byte[] report) { int w; return WriteFile(h, report, report.Length, out w, IntPtr.Zero); }
+    public static bool Read(SafeFileHandle h, byte[] buf, out int n) { return ReadFile(h, buf, buf.Length, out n, IntPtr.Zero); }
+
+    public static SafeFileHandle Open(string path)
     {
         var h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
         if (h.IsInvalid) h = CreateFile(path, 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
